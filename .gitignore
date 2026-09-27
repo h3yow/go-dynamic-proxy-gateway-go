@@ -1,0 +1,5 @@
+# runtime artifacts: simulated upstream behavior/state files and binaries
+/runtime/
+/configs/
+*.out
+/gateway
