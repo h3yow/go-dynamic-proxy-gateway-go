@@ -17,13 +17,19 @@ curl http://127.0.0.1:8080/hello                       # 默认路由，wrr 2:1 
 curl -H 'Host: api.local' http://127.0.0.1:8080/users/1  # Host+前缀路由，粘性会话
 
 # 4. 热更新：直接编辑 examples/config.json，网关每秒轮询，mtime 变化即尝试加载
+
+# 5. 复现“端口活着但业务故障”：把 9002 的业务健康开关关掉（端口仍在监听）
+curl 'http://127.0.0.1:9002/admin/health?ok=0'
+sleep 3
+curl http://127.0.0.1:8080/hello     # web-svc 唯一后端被摘除 -> no_healthy
+curl 'http://127.0.0.1:9002/admin/health?ok=1'   # 业务恢复，探测连续成功后自动加回
 ```
 
 ## 配置说明（examples/config.json）
 
 - `listen_addr`：网关监听地址。
 - `routes[]`：`host`（空 = 通配任意 Host）、`path_prefix`（必须以 `/` 开头）、`upstream`（引用集群名）、`sticky`（是否启用粘性会话）。
-- `upstreams[]`：`name`、`policy`（`wrr` 加权轮询 / `least_conn` 最少连接）、`backends`（`addr` + 正整数 `weight`）、`health_check`（`interval`/`timeout`/`fail_threshold`/`recover_threshold`）。
+- `upstreams[]`：`name`、`policy`（`wrr` 加权轮询 / `least_conn` 最少连接）、`backends`（`addr` + 正整数 `weight`）、`health_check`（`interval`/`timeout`/`fail_threshold`/`recover_threshold`，可选 `path` 启用 HTTP 业务探测）。
 - `rate_limit`：`enabled`、`rate`（每秒补令牌数）、`burst`（桶容量）。
 - `proxy`：`upstream_timeout`（单次上游请求超时）、`max_retries`（幂等请求最大重试次数）。
 
@@ -52,13 +58,24 @@ curl -H 'Host: api.local' http://127.0.0.1:8080/users/1  # Host+前缀路由，�
 
 ## 健康检查与故障摘除
 
-- **主动检查**：按 `interval` 对每个后端做 TCP 建连探测（`timeout` 超时判失败）。
-- **被动检查**：每次真实请求的结果也会上报，驱动同一状态机。
+健康判断按**业务结果**而非“进程活着”：端口在监听但业务持续失败的上游会被判定为不可用、不再接新流量，业务恢复后自动加回。
+
+- **主动检查**：按 `interval` 探测每个后端（单次超时 `timeout`）：
+  - 配置 `health_check.path`（如 `/healthz`）时，发起 `GET http://addr+path`，
+    **仅 2xx/3xx 视为健康**；4xx/5xx、连接失败、超时均视为失败；
+  - 不写 `path` 时保持原有 TCP 建连探测（旧配置无需修改即可照常加载与运行）。
+- **被动检查**：真实请求的结果参与同一套可用性状态机——连接/传输失败、超时、
+  **上游返回 5xx** 都计为失败；2xx/3xx/4xx 计为成功（4xx 是客户端问题，不代表上游不健康）。
 - 连续失败 `fail_threshold` 次 → 摘除（不再参与负载均衡与粘性选择）；
   连续成功 `recover_threshold` 次 → 重新加入。
+- 摘除与恢复可通过真实请求链路直接观察：单后端集群被摘除后请求返回
+  `503` + `X-Gateway-Error: no_healthy`；恢复后重新返回上游的正常响应。
+- 健康集合变化不破坏粘性会话：rendezvous 哈希保证同一会话的落点唯一且可复现
+  （详见“负载均衡与粘性会话”）。
 - 集群无健康后端时返回 `503` + `X-Gateway-Error: no_healthy`。
 
-验证：`go test ./internal/upstream/ -v`；或运行 demo 后 `pkill -f ':9002'` 观察日志中 `健康检查状态变更`。
+验证：`go test ./internal/upstream/ ./internal/proxy/ -v`；或按“快速开始”第 5 步用
+`/admin/health` 开关制造业务故障，观察日志中 `探测失败` / `健康检查状态变更`。
 
 ## 限流
 
@@ -73,6 +90,10 @@ curl -H 'Host: api.local' http://127.0.0.1:8080/users/1  # Host+前缀路由，�
 - 每次上游请求带独立 `context` 超时（`upstream_timeout`），超时返回 `504` + `X-Gateway-Error: upstream_timeout`。
 - **重试只对幂等方法**（GET/HEAD/OPTIONS/PUT/DELETE）生效，最多 `max_retries` 次；
   POST 等非幂等方法绝不重试，避免上游被重复调用产生重复副作用。
+- 连接/传输失败、超时、**上游 5xx** 都会触发重试（仍有剩余次数时）；
+  若是最后一次尝试，上游 5xx 响应会**原样透传**给客户端（但仍计入健康判断的失败）。
+- **请求体重放**：带请求体的幂等请求（如 PUT）在重试时，上游每次收到的请求体与第一次
+  逐字节一致——网关会在首次转发前把请求体完整读入内存，每次尝试都用全新 reader 发送。
 - 客户端取消/断开会通过 `context` 传播到上游请求，立即中断且不再重试。
 - 上游传输失败返回 `502` + `X-Gateway-Error: upstream_fail`。
 
@@ -98,12 +119,16 @@ curl -H 'Host: api.local' http://127.0.0.1:8080/users/1  # Host+前缀路由，�
 | `upstream_fail` | 502 | 上游连接/传输失败 |
 | `upstream_timeout` | 504 | 上游超时 |
 
+注：上游 5xx 不出现在该响应头中——最后一次尝试会把上游的 5xx 响应原样透传给客户端，
+网关在日志中以 `reason=upstream_5xx` 记录，并将其计入健康判断的失败。
+
 ## 测试
 
 ```bash
-go test ./... -race -v
+go test -race -count=1 ./...
 ```
 
-覆盖：并发请求下的热更新原子性、非法配置拒绝、上游故障摘除与恢复、粘性会话确定性迁移、
-限流边界与并发一致性、客户端取消传播、上游超时、幂等重试/非幂等不重试。
-测试日志中会打印关键判定依据（如迁移会话数、重试调用次数、限流放行数）。
+覆盖：并发请求下的热更新原子性、非法配置拒绝、HTTP 业务探测摘除与恢复（含 TCP 探测兼容）、
+真实请求 5xx 触发摘除与自动恢复（走完整请求链路观察）、粘性会话在健康集合变化下的确定性迁移、
+限流边界与并发一致性、客户端取消传播、上游超时、幂等重试/非幂等不重试、重试请求体逐字节一致。
+测试日志中会打印关键判定依据（如连续失败/成功次数、迁移会话数、重试调用次数、限流放行数）。

@@ -46,6 +46,9 @@ type HealthCheckConf struct {
 	Timeout          time.Duration `json:"timeout"`
 	FailThreshold    int           `json:"fail_threshold"`    // 连续失败多少次摘除
 	RecoverThreshold int           `json:"recover_threshold"` // 连续成功多少次恢复
+	// Path 非空时按业务结果探测：GET http://addr+Path，2xx/3xx 视为健康；
+	// 为空时保持原有 TCP 建连探测（旧配置不写该字段行为不变）。
+	Path string `json:"path,omitempty"`
 }
 
 // RateLimitConf 按客户端限流参数（令牌桶）。
@@ -120,6 +123,9 @@ func Validate(c *Config) error {
 		}
 		if hc.FailThreshold <= 0 || hc.RecoverThreshold <= 0 {
 			return fmt.Errorf("upstream %q 的 health_check 阈值必须为正整数", u.Name)
+		}
+		if hc.Path != "" && !strings.HasPrefix(hc.Path, "/") {
+			return fmt.Errorf("upstream %q 的 health_check path %q 必须以 / 开头", u.Name, hc.Path)
 		}
 	}
 

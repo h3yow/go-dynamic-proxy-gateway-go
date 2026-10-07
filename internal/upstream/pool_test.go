@@ -2,7 +2,13 @@ package upstream
 
 import (
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/h3yow/go-dynamic-proxy-gateway-go/internal/config"
 )
@@ -129,4 +135,99 @@ func TestAllDown(t *testing.T) {
 		}
 	}
 	t.Log("全部后端摘除后，选择返回 ok=false，由上层返回 503")
+}
+
+// waitFor 轮询直到 cond 成立或超时，用于观察异步健康检查循环的效果。
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("等待超时: %s", what)
+}
+
+// TestHTTPProbeEjectAndRecover 配置 path 后按业务结果探测：
+// /healthz 返回 500 时连续失败 fail_threshold 次被摘除，
+// 恢复 200 后连续成功 recover_threshold 次重新加入。
+func TestHTTPProbeEjectAndRecover(t *testing.T) {
+	var bizOK atomic.Bool
+	bizOK.Store(true)
+	var probeCount atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			t.Errorf("探测路径应为 /healthz，实际 %s", r.URL.Path)
+		}
+		probeCount.Add(1)
+		if !bizOK.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	p := NewPool(config.Upstream{
+		Name:   "svc",
+		Policy: "wrr",
+		Backends: []config.Server{
+			{Addr: strings.TrimPrefix(up.URL, "http://"), Weight: 1},
+		},
+		HealthCheck: config.HealthCheckConf{
+			Interval: 10 * time.Millisecond, Timeout: time.Second,
+			FailThreshold: 2, RecoverThreshold: 2,
+			Path: "/healthz",
+		},
+	})
+	stop := make(chan struct{})
+	defer close(stop)
+	go p.Start(stop)
+
+	waitFor(t, "初始应探测为健康", func() bool { return len(p.HealthyBackends()) == 1 })
+	t.Logf("初始：/healthz 返回 200，后端健康（已探测 %d 次）", probeCount.Load())
+
+	// 端口仍在监听，但业务返回 500：必须被判定为不可用。
+	bizOK.Store(false)
+	waitFor(t, "业务 500 连续 2 次后应摘除", func() bool { return len(p.HealthyBackends()) == 0 })
+	t.Logf("业务失败：/healthz 返回 500，连续失败达到 fail_threshold=2，后端被摘除（此时端口仍在监听）")
+
+	// 业务恢复后自动加回。
+	bizOK.Store(true)
+	waitFor(t, "业务恢复连续 2 次后应重新加入", func() bool { return len(p.HealthyBackends()) == 1 })
+	t.Logf("业务恢复：/healthz 返回 200，连续成功达到 recover_threshold=2，后端自动恢复")
+}
+
+// TestTCPProbeBackwardCompat 不配置 path 时保持原有 TCP 建连探测行为：
+// 旧配置不写新字段也能照常工作。
+func TestTCPProbeBackwardCompat(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	p := NewPool(config.Upstream{
+		Name:   "svc",
+		Policy: "wrr",
+		Backends: []config.Server{
+			{Addr: addr, Weight: 1},
+		},
+		HealthCheck: config.HealthCheckConf{ // 无 Path 字段，等价于旧配置
+			Interval: 10 * time.Millisecond, Timeout: 200 * time.Millisecond,
+			FailThreshold: 1, RecoverThreshold: 1,
+		},
+	})
+	stop := make(chan struct{})
+	defer close(stop)
+	go p.Start(stop)
+
+	waitFor(t, "TCP 可建连时应健康", func() bool { return len(p.HealthyBackends()) == 1 })
+	t.Log("未配置 path：TCP 建连成功即视为健康（旧行为）")
+
+	ln.Close()
+	waitFor(t, "端口关闭后应摘除", func() bool { return len(p.HealthyBackends()) == 0 })
+	t.Log("端口关闭后 TCP 建连失败，后端被摘除（旧行为保持不变）")
 }

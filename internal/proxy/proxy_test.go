@@ -6,8 +6,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -258,4 +260,223 @@ func TestNoRoute(t *testing.T) {
 		t.Fatalf("X-Gateway-Error 应为 no_route，实际 %q", got)
 	}
 	t.Log("Host/前缀不匹配时返回 404 + X-Gateway-Error=no_route")
+}
+
+// TestPassive5xxEjectAndRecoverViaRealTraffic 真实请求链路观察摘除与恢复：
+// 上游业务返回 500 -> 真实请求计入失败 -> 达到阈值后摘除（客户端看到 503）；
+// 业务恢复 200 -> 主动 HTTP 探测连续成功 -> 自动恢复（客户端重新看到 200）。
+func TestPassive5xxEjectAndRecoverViaRealTraffic(t *testing.T) {
+	var bizOK atomic.Bool
+	bizOK.Store(false) // 初始即业务故障：端口在监听，但业务请求与探测都返回 500
+	var bizHits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" { // 主动探测路径
+			if bizOK.Load() {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			return
+		}
+		bizHits.Add(1)
+		if bizOK.Load() {
+			fmt.Fprint(w, "OK")
+		} else {
+			w.WriteHeader(http.StatusInternalServerError) // 业务故障
+		}
+	}))
+	defer up.Close()
+
+	gw, _ := newGateway(t, func(c *config.Config) {
+		c.Upstreams[0].Backends[0].Addr = strings.TrimPrefix(up.URL, "http://")
+		c.Upstreams[0].HealthCheck = config.HealthCheckConf{
+			Interval: 10 * time.Millisecond, Timeout: time.Second,
+			FailThreshold: 3, RecoverThreshold: 2,
+			Path: "/healthz",
+		}
+		c.Proxy.MaxRetries = 2
+	})
+	srv := httptest.NewServer(proxy.NewHandler(gw))
+	defer srv.Close()
+
+	// 1. 业务 500：一个幂等 GET 触发 1+2 次尝试，全部 500；最后一次透传给客户端。
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+		resp.Body.Close()
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("最后一次尝试应透传上游 500，实际 %d", resp.StatusCode)
+	}
+	hits := bizHits.Load()
+	if hits != 3 {
+		t.Fatalf("幂等 GET 应尝试 3 次（1+2 重试），实际 %d 次", hits)
+	}
+	t.Logf("业务 500：客户端收到透传的 500（body=%q），上游被真实请求打了 %d 次 = 1 + max_retries(2)，3 次失败均已计入健康判断", body, hits)
+
+	// 2. 连续失败达到 fail_threshold=3，后端已被摘除：客户端直接看到 503，不再打上游。
+	before := bizHits.Load()
+	resp2, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("摘除后应返回 503，实际 %d", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("X-Gateway-Error"); got != proxy.ErrNoHealthy {
+		t.Fatalf("X-Gateway-Error 应为 no_healthy，实际 %q", got)
+	}
+	if got := bizHits.Load(); got != before {
+		t.Fatalf("摘除后不应再有流量打到故障上游，实际新增 %d 次", got-before)
+	}
+	t.Logf("摘除生效：客户端看到 503 + no_healthy，故障上游请求数保持 %d 不再增长（端口仍在监听）", before)
+
+	// 3. 业务恢复 200：主动探测连续成功 recover_threshold=2 次后自动加回。
+	bizOK.Store(true)
+	deadline := time.Now().Add(3 * time.Second)
+	var finalStatus int
+	for time.Now().Before(deadline) {
+		resp3, err := http.Get(srv.URL + "/")
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		finalStatus = resp3.StatusCode
+		resp3.Body.Close()
+		if finalStatus == http.StatusOK {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if finalStatus != http.StatusOK {
+		t.Fatalf("业务恢复后应重新看到 200，实际 %d", finalStatus)
+	}
+	t.Logf("恢复生效：/healthz 连续成功达到 recover_threshold=2，后端自动加回，客户端重新看到 200（上游累计被真实请求调用 %d 次）", bizHits.Load())
+}
+
+// TestRetryBodyReplay 带请求体的幂等请求（PUT）重试时，
+// 上游每次收到的请求体必须与第一次完全一致。
+func TestRetryBodyReplay(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	var calls atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		n := calls.Add(1)
+		if n < 3 { // 前两次返回 500，第三次才成功
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, "OK")
+	}))
+	defer up.Close()
+
+	gw, _ := newGateway(t, func(c *config.Config) {
+		c.Upstreams[0].Backends[0].Addr = strings.TrimPrefix(up.URL, "http://")
+		c.Upstreams[0].HealthCheck.FailThreshold = 100 // 避免 5xx 上报触发摘除，干扰重试计数
+		c.Proxy.MaxRetries = 2
+	})
+	srv := httptest.NewServer(proxy.NewHandler(gw))
+	defer srv.Close()
+
+	payload := "payload-" + strings.Repeat("x", 1024) // 非平凡请求体
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/resource/1", strings.NewReader(payload))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT 请求失败: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "OK" {
+		t.Fatalf("第 3 次尝试应成功，实际 status=%d body=%q", resp.StatusCode, body)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("应尝试 3 次（1+2 重试），实际 %d 次", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, b := range bodies {
+		if b != payload {
+			t.Fatalf("第 %d 次尝试的请求体与第一次不一致：len=%d（期望 %d）", i+1, len(b), len(payload))
+		}
+	}
+	t.Logf("PUT 重试 %d 次，上游每次收到的请求体均为 %d 字节且逐字节一致（前 2 次 500，第 3 次 200）", len(bodies), len(payload))
+}
+
+// TestStickySessionAcrossHealthChange 粘性会话在健康集合变化时保持唯一且可复现：
+// 同一会话始终落同一后端；该后端被摘除后确定性地迁移到另一后端；
+// 恢复后回到初始后端。全程通过真实请求链路（Cookie）观察。
+func TestStickySessionAcrossHealthChange(t *testing.T) {
+	mk := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, name)
+		}))
+	}
+	alpha, beta := mk("alpha"), mk("beta")
+	defer alpha.Close()
+	defer beta.Close()
+
+	gw, _ := newGateway(t, func(c *config.Config) {
+		c.Routes = []config.Route{{PathPrefix: "/", Upstream: "svc", Sticky: true}}
+		c.Upstreams[0].Backends = []config.Server{
+			{Addr: strings.TrimPrefix(alpha.URL, "http://"), Weight: 1},
+			{Addr: strings.TrimPrefix(beta.URL, "http://"), Weight: 1},
+		}
+		c.Upstreams[0].HealthCheck.FailThreshold = 1
+		c.Upstreams[0].HealthCheck.RecoverThreshold = 1
+	})
+	srv := httptest.NewServer(proxy.NewHandler(gw))
+	defer srv.Close()
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	get := func() string {
+		resp, err := client.Get(srv.URL + "/")
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("期望 200，实际 %d", resp.StatusCode)
+		}
+		return string(b)
+	}
+
+	// 1. 健康集合不变：同一会话（同一 Cookie）永远落同一后端。
+	first := get()
+	for i := 0; i < 5; i++ {
+		if got := get(); got != first {
+			t.Fatalf("健康集合不变时会话乱跳：%s -> %s", first, got)
+		}
+	}
+	t.Logf("健康集合不变：同一会话连续 6 次请求均落在 %s", first)
+
+	// 2. 摘除该后端：会话确定性迁移到另一后端，且多次请求结果一致。
+	pool := gw.Snapshot().Pools["svc"]
+	victimAddr := strings.TrimPrefix(alpha.URL, "http://")
+	want := "beta"
+	if first == "beta" {
+		victimAddr = strings.TrimPrefix(beta.URL, "http://")
+		want = "alpha"
+	}
+	pool.ReportResult(victimAddr, false) // failThreshold=1，立即摘除
+	for i := 0; i < 3; i++ {
+		if got := get(); got != want {
+			t.Fatalf("摘除后会话应确定性迁移到 %s，实际 %s", want, got)
+		}
+	}
+	t.Logf("摘除 %s 所在后端后：同一会话 3 次请求均确定性落在 %s（rendezvous 哈希最小迁移）", first, want)
+
+	// 3. 恢复后会话回到初始后端。
+	pool.ReportResult(victimAddr, true) // recoverThreshold=1，立即恢复
+	if got := get(); got != first {
+		t.Fatalf("恢复后会话应回到 %s，实际 %s", first, got)
+	}
+	t.Logf("后端恢复后：同一会话回到初始后端 %s，全程无错配", first)
 }

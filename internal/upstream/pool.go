@@ -4,7 +4,9 @@ package upstream
 import (
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net"
+	"net/http"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -181,19 +183,38 @@ func (p *Pool) checkOnce() {
 	p.mu.Unlock()
 
 	for _, addr := range addrs {
-		ok := probe(addr, p.hc.Timeout)
+		ok, detail := probe(addr, p.hc)
 		if changed, healthy := p.report(addr, ok); changed {
 			logf("集群 %s 后端 %s 健康检查状态变更 -> healthy=%v", p.name, addr, healthy)
+		}
+		if !ok {
+			logf("集群 %s 后端 %s 探测失败: %s", p.name, addr, detail)
 		}
 	}
 }
 
-// probe 通过 TCP 建连探测后端是否存活。
-func probe(addr string, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", addr, timeout)
-	if err != nil {
-		return false
+// probe 探测后端是否健康。
+// 配置了 path 时按业务结果判定：GET http://addr+path，2xx/3xx 视为健康，
+// 其余状态码、连接失败、超时均视为失败；未配置 path 时退化为 TCP 建连探测。
+// 返回是否健康及失败原因（供日志与测试观察）。
+func probe(addr string, hc config.HealthCheckConf) (bool, string) {
+	if hc.Path == "" {
+		conn, err := net.DialTimeout("tcp", addr, hc.Timeout)
+		if err != nil {
+			return false, "TCP 建连失败: " + err.Error()
+		}
+		conn.Close()
+		return true, ""
 	}
-	conn.Close()
-	return true
+	client := &http.Client{Timeout: hc.Timeout}
+	resp, err := client.Get("http://" + addr + hc.Path)
+	if err != nil {
+		return false, "HTTP 探测请求失败: " + err.Error()
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return true, ""
+	}
+	return false, fmt.Sprintf("HTTP 探测返回状态码 %d（仅 2xx/3xx 视为健康）", resp.StatusCode)
 }
