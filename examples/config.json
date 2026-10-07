@@ -1,1 +1,39 @@
-{"listen_addr": "127.0.0.1:8080", "routes": [{"host": "api.local", "path_prefix": "/users/", "upstream": "user-svc", "sticky": true}, {"host": "", "path_prefix": "/", "upstream": "web-svc"}], "upstreams": [{"name": "user-svc", "policy": "least_conn", "backends": [{"addr": "127.0.0.1:9001", "weight": 1}, {"addr": "127.0.0.1:9002", "weight": 1}], "health_check": {"interval": 1000000000, "timeout": 500000000, "fail_threshold": 2, "recover_threshold": 2}}, {"name": "web-svc", "policy": "wrr", "backends": [{"addr": "127.0.0.1:9002", "weight": 1}], "health_check": {"interval": 1000000000, "timeout": 500000000, "fail_threshold": 2, "recover_threshold": 2}}], "rate_limit": {"enabled": true, "rate": 50, "burst": 100}, "proxy": {"upstream_timeout": 2000000000, "max_retries": 2}}
+{
+  "listen_addr": "127.0.0.1:8080",
+  "routes": [
+    {"host": "api.local", "path_prefix": "/users/", "upstream": "user-svc", "sticky": true},
+    {"host": "", "path_prefix": "/", "upstream": "web-svc"}
+  ],
+  "upstreams": [
+    {
+      "name": "user-svc",
+      "policy": "least_conn",
+      "backends": [
+        {"addr": "127.0.0.1:9001", "weight": 1},
+        {"addr": "127.0.0.1:9002", "weight": 1}
+      ],
+      "health_check": {
+        "interval": 1000000000,
+        "timeout": 500000000,
+        "fail_threshold": 2,
+        "recover_threshold": 2,
+        "probe_path": "/healthz"
+      }
+    },
+    {
+      "name": "web-svc",
+      "policy": "wrr",
+      "backends": [
+        {"addr": "127.0.0.1:9002", "weight": 1}
+      ],
+      "health_check": {
+        "interval": 1000000000,
+        "timeout": 500000000,
+        "fail_threshold": 2,
+        "recover_threshold": 2
+      }
+    }
+  ],
+  "rate_limit": {"enabled": true, "rate": 50, "burst": 100},
+  "proxy": {"upstream_timeout": 2000000000, "max_retries": 2}
+}

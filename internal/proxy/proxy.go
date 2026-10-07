@@ -2,10 +2,12 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -27,6 +29,26 @@ const (
 )
 
 const stickyCookie = "GWSESSION"
+
+// maxBufferedBody 限制重试时在内存中缓冲的请求/响应体大小，避免异常大体耗尽内存。
+const maxBufferedBody = 16 << 20
+
+// attemptResult 是一次上游尝试的结果。
+type attemptResult struct {
+	errReason string // 传输类失败原因常量；为空表示拿到了上游响应
+	status    int
+	header    http.Header
+	body      []byte
+}
+
+// failed 表示这次尝试是否应按失败计入健康判断/重试。
+// 只有传输错误、超时与上游 5xx 算失败；4xx 等业务应答算成功（上游是通的）。
+func (a attemptResult) failed() bool {
+	if a.errReason != "" {
+		return true
+	}
+	return a.status >= 500
+}
 
 // Handler 是网关的 HTTP 入口处理器。
 type Handler struct {
@@ -81,40 +103,103 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sessionKey = sessionID(w, r)
 	}
 
+	idempotent := isIdempotent(r.Method)
+
+	// 4. 幂等请求可能重试：先把请求体完整读入内存并在每次尝试时重建，
+	// 保证上游每次收到的字节与第一次完全一致。非幂等请求绝不重试，直接透传 body。
+	var bodyBytes []byte
+	var passThroughBody io.Reader = r.Body
+	retryable := idempotent
+	if idempotent && r.Body != nil {
+		data, err := io.ReadAll(io.LimitReader(r.Body, maxBufferedBody+1))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, ErrUpstreamFail)
+			return
+		}
+		if len(data) > maxBufferedBody {
+			// 超过缓冲上限的请求体不支持重试：降级为只尝试一次，
+			// 用 MultiReader 把已读前缀和未读完的流拼起来，保证不丢字节。
+			retryable = false
+			passThroughBody = io.MultiReader(bytes.NewReader(data), r.Body)
+		} else {
+			bodyBytes = data
+		}
+	}
 	attempts := 1
-	if isIdempotent(r.Method) {
+	if retryable {
 		attempts += snap.Cfg.Proxy.MaxRetries
 	}
 
-	var lastErr string
+	var last attemptResult
+	tried := 0
 	for i := 0; i < attempts; i++ {
 		srv, done, ok := pickBackend(pool, route, sessionKey)
 		if !ok {
 			writeErr(w, http.StatusServiceUnavailable, ErrNoHealthy)
 			return
 		}
-		errReason := h.forward(w, r, snap.Cfg.Proxy, srv.Addr)
+
+		var bodyReader io.Reader
+		if retryable {
+			bodyReader = bytes.NewReader(bodyBytes)
+		} else {
+			bodyReader = passThroughBody
+		}
+		res := h.forward(r, snap.Cfg.Proxy, srv.Addr, bodyReader)
+		tried++
 		if done != nil {
-			done(errReason == "")
+			done(!res.failed())
 		}
-		pool.ReportResult(srv.Addr, errReason == "")
-		if errReason == "" {
-			return // 成功
+		pool.ReportResult(srv.Addr, !res.failed())
+
+		if !res.failed() {
+			flushResult(w, res)
+			if i > 0 {
+				log.Printf("[proxy] addr=%s 第%d次尝试成功（共转发 %d 次）", srv.Addr, i+1, tried)
+			}
+			return
 		}
-		lastErr = errReason
+		last = res
 		// 客户端已取消：不要再重试，也不必写响应。
 		if r.Context().Err() != nil {
 			log.Printf("[proxy] 客户端取消，终止重试 client=%s path=%s", clientIP(r), r.URL.Path)
 			return
 		}
-		log.Printf("[proxy] 上游失败 addr=%s reason=%s 第%d次尝试，准备重试", srv.Addr, errReason, i+1)
+		if i+1 < attempts {
+			log.Printf("[proxy] 上游失败 addr=%s reason=%s 第%d次尝试，准备重试", srv.Addr, failureReason(res), i+1)
+		} else {
+			log.Printf("[proxy] 上游失败 addr=%s reason=%s 第%d次尝试，重试次数用尽", srv.Addr, failureReason(res), i+1)
+		}
 	}
 
+	// 所有尝试均失败：拿到过上游 5xx 响应则透传该响应，否则按网关错误返回。
+	if last.errReason == "" {
+		log.Printf("[proxy] 上游连续返回 %d，共转发 %d 次仍失败，透传错误响应", last.status, tried)
+		flushResult(w, last)
+		return
+	}
 	status := http.StatusBadGateway
-	if lastErr == ErrUpstreamTimed {
+	if last.errReason == ErrUpstreamTimed {
 		status = http.StatusGatewayTimeout
 	}
-	writeErr(w, status, lastErr)
+	writeErr(w, status, last.errReason)
+}
+
+// failureReason 返回用于日志的失败原因（传输错误或上游状态码）。
+func failureReason(a attemptResult) string {
+	if a.errReason != "" {
+		return a.errReason
+	}
+	return fmt.Sprintf("status_%d", a.status)
+}
+
+// flushResult 把缓冲的上游响应写回客户端。
+func flushResult(w http.ResponseWriter, a attemptResult) {
+	copyHeader(w.Header(), a.header)
+	w.WriteHeader(a.status)
+	if len(a.body) > 0 {
+		_, _ = w.Write(a.body)
+	}
 }
 
 // pickBackend 选择后端：粘性会话走 rendezvous 哈希，否则走负载均衡器。
@@ -130,8 +215,10 @@ func pickBackend(pool *upstream.Pool, route config.Route, sessionKey string) (co
 	return picker.Pick()
 }
 
-// forward 执行一次上游转发；返回 "" 表示成功，否则返回失败原因常量。
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, pc config.ProxyConf, addr string) string {
+// forward 执行一次上游转发。返回值中 errReason 为空表示拿到了上游响应
+// （调用方再根据状态码决定成败与是否重试）。响应体先缓冲在内存中，
+// 这样 5xx 等失败响应不会在重试前已经写回客户端。
+func (h *Handler) forward(r *http.Request, pc config.ProxyConf, addr string, body io.Reader) attemptResult {
 	ctx, cancel := context.WithTimeout(r.Context(), pc.UpstreamTimeout)
 	defer cancel()
 
@@ -140,20 +227,35 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, pc config.Prox
 	req.URL.Scheme = "http"
 	req.URL.Host = addr
 	req.Host = addr
+	if body != nil {
+		req.Body = io.NopCloser(body)
+		// 已缓冲的 body 长度是已知的，设置 ContentLength 让每次尝试一致。
+		if rc, ok := body.(*bytes.Reader); ok {
+			req.ContentLength = rc.Size()
+		}
+	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
-			return ErrUpstreamTimed
+			return attemptResult{errReason: ErrUpstreamTimed}
 		}
-		return ErrUpstreamFail
+		return attemptResult{errReason: ErrUpstreamFail}
 	}
 	defer resp.Body.Close()
 
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-	return ""
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedBody+1))
+	if err != nil {
+		return attemptResult{errReason: ErrUpstreamFail}
+	}
+	if len(data) > maxBufferedBody {
+		// 响应体过大：按上游失败处理，避免缓冲无界内存。
+		return attemptResult{errReason: ErrUpstreamFail}
+	}
+
+	header := make(http.Header, len(resp.Header))
+	copyHeader(header, resp.Header)
+	return attemptResult{status: resp.StatusCode, header: header, body: data}
 }
 
 // isIdempotent 判断方法是否幂等；只有幂等请求才允许重试，

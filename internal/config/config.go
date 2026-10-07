@@ -46,6 +46,14 @@ type HealthCheckConf struct {
 	Timeout          time.Duration `json:"timeout"`
 	FailThreshold    int           `json:"fail_threshold"`    // 连续失败多少次摘除
 	RecoverThreshold int           `json:"recover_threshold"` // 连续成功多少次恢复
+
+	// ProbePath 配置后按 HTTP GET http://<addr><probe_path> 做业务级探测，
+	// 根据上游实际返回的状态码判定健康（端口在监听但业务报错也能被摘除）。
+	// 留空（旧配置）时沿用 TCP 建连探测，行为与旧版本完全一致。
+	ProbePath string `json:"probe_path"`
+	// SuccessStatuses 是 HTTP 探测视为“成功”的状态码白名单；
+	// 留空时默认所有 2xx 视为成功。ProbePath 为空时此项不生效。
+	SuccessStatuses []int `json:"success_statuses"`
 }
 
 // RateLimitConf 按客户端限流参数（令牌桶）。
@@ -120,6 +128,14 @@ func Validate(c *Config) error {
 		}
 		if hc.FailThreshold <= 0 || hc.RecoverThreshold <= 0 {
 			return fmt.Errorf("upstream %q 的 health_check 阈值必须为正整数", u.Name)
+		}
+		if hc.ProbePath != "" && !strings.HasPrefix(hc.ProbePath, "/") {
+			return fmt.Errorf("upstream %q 的 health_check.probe_path %q 必须以 / 开头", u.Name, hc.ProbePath)
+		}
+		for _, code := range hc.SuccessStatuses {
+			if code < 100 || code > 599 {
+				return fmt.Errorf("upstream %q 的 health_check.success_statuses 中状态码 %d 非法", u.Name, code)
+			}
 		}
 	}
 
